@@ -26,6 +26,7 @@ import (
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	"k8s.io/api/admission/v1beta1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -363,6 +364,175 @@ var _ = Describe("application", func() {
 			Expect(w.Body).To(ContainSubstring(`"code":200`))
 
 		})
+
+		It("should scaffold a validating webhook if a MetaValidator is specified", func() {
+			By("creating a controller manager")
+			m, err := manager.New(cfg, manager.Options{})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("registering the type in the Scheme")
+			builder := scheme.Builder{GroupVersion: testMetaValidatorObjGVK.GroupVersion()}
+			builder.Register(&TestMetaValidatorObj{}, &TestMetaValidatorObjList{})
+			err = builder.AddToScheme(m.GetScheme())
+			Expect(err).NotTo(HaveOccurred())
+
+			err = WebhookManagedBy(m).
+				For(&TestMetaValidatorObj{}).
+				UsingValidator(&TestMetaValidator{}).
+				Complete()
+			Expect(err).NotTo(HaveOccurred())
+			svr := m.GetWebhookServer()
+			Expect(svr).NotTo(BeNil())
+
+			reader := strings.NewReader(`{
+  "kind":"AdmissionReview",
+  "apiVersion":"admission.k8s.io/v1beta1",
+  "request":{
+    "uid":"07e52e8d-4513-11e9-a716-42010a800270",
+    "kind":{
+      "group":"",
+      "version":"v1",
+      "kind":"TestMetaValidatorObj"
+    },
+    "resource":{
+      "group":"",
+      "version":"v1",
+      "resource":"testmetavalidatorobj"
+    },
+    "namespace":"default",
+    "operation":"UPDATE",
+    "object":{
+      "replica":1
+    },
+    "oldObject":{
+      "replica":2
+    }
+  }
+}`)
+
+			stopCh := make(chan struct{})
+			close(stopCh)
+			err = svr.Start(stopCh)
+			if err != nil && !os.IsNotExist(err) {
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			By("sending a request to a mutating webhook path that doesn't exist")
+			path := generateMutatePath(testMetaValidatorObjGVK)
+			req := httptest.NewRequest("POST", "http://svc-name.svc-ns.svc"+path, reader)
+			req.Header.Add(http.CanonicalHeaderKey("Content-Type"), "application/json")
+			w := httptest.NewRecorder()
+			svr.WebhookMux.ServeHTTP(w, req)
+			Expect(w.Code).To(Equal(http.StatusNotFound))
+
+			By("sending a request to a validating webhook path")
+			path = generateValidatePath(testMetaValidatorObjGVK)
+			req = httptest.NewRequest("POST", "http://svc-name.svc-ns.svc"+path, reader)
+			req.Header.Add(http.CanonicalHeaderKey("Content-Type"), "application/json")
+			w = httptest.NewRecorder()
+			svr.WebhookMux.ServeHTTP(w, req)
+			Expect(w.Code).To(Equal(http.StatusOK))
+			By("sanity checking the response contains reasonable field")
+			Expect(w.Body).To(ContainSubstring(`"allowed":false`))
+			Expect(w.Body).To(ContainSubstring(`"code":403`))
+		})
+
+		It("should scaffold a validating webhook if a MetaValidator is provided to validate deletes", func() {
+			By("creating a controller manager")
+			m, err := manager.New(cfg, manager.Options{})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("registering the type in the Scheme")
+			builder := scheme.Builder{GroupVersion: testMetaValidatorObjGVK.GroupVersion()}
+			builder.Register(&TestMetaValidatorObj{}, &TestMetaValidatorObjList{})
+			err = builder.AddToScheme(m.GetScheme())
+			Expect(err).NotTo(HaveOccurred())
+
+			err = WebhookManagedBy(m).
+				For(&TestMetaValidatorObj{}).
+				UsingValidator(&TestMetaValidator{}).
+				Complete()
+			Expect(err).NotTo(HaveOccurred())
+			svr := m.GetWebhookServer()
+			Expect(svr).NotTo(BeNil())
+
+			reader := strings.NewReader(`{
+  "kind":"AdmissionReview",
+  "apiVersion":"admission.k8s.io/v1beta1",
+  "request":{
+    "uid":"07e52e8d-4513-11e9-a716-42010a800270",
+    "kind":{
+      "group":"",
+      "version":"v1",
+      "kind":"TestMetaValidatorObj"
+    },
+    "resource":{
+      "group":"",
+      "version":"v1",
+      "resource":"testmetavalidatorobj"
+    },
+    "namespace":"default",
+    "operation":"DELETE",
+    "object":null,
+    "oldObject":{
+      "replica":1
+    }
+  }
+}`)
+			stopCh := make(chan struct{})
+			close(stopCh)
+			// TODO: we may want to improve it to make it be able to inject dependencies,
+			// but not always try to load certs and return not found error.
+			err = svr.Start(stopCh)
+			if err != nil && !os.IsNotExist(err) {
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			By("sending a request to a validating webhook path to check for failed delete")
+			path := generateValidatePath(testMetaValidatorObjGVK)
+			req := httptest.NewRequest("POST", "http://svc-name.svc-ns.svc"+path, reader)
+			req.Header.Add(http.CanonicalHeaderKey("Content-Type"), "application/json")
+			w := httptest.NewRecorder()
+			svr.WebhookMux.ServeHTTP(w, req)
+			Expect(w.Code).To(Equal(http.StatusOK))
+			By("sanity checking the response contains reasonable field")
+			Expect(w.Body).To(ContainSubstring(`"allowed":false`))
+			Expect(w.Body).To(ContainSubstring(`"code":403`))
+
+			reader = strings.NewReader(`{
+  "kind":"AdmissionReview",
+  "apiVersion":"admission.k8s.io/v1beta1",
+  "request":{
+    "uid":"07e52e8d-4513-11e9-a716-42010a800270",
+    "kind":{
+      "group":"",
+      "version":"v1",
+      "kind":"TestMetaValidatorObj"
+    },
+    "resource":{
+      "group":"",
+      "version":"v1",
+      "resource":"testmetavalidatorobj"
+    },
+    "namespace":"default",
+    "operation":"DELETE",
+    "object":null,
+    "oldObject":{
+      "replica":0
+    }
+  }
+}`)
+			By("sending a request to a validating webhook path with correct request")
+			path = generateValidatePath(testMetaValidatorObjGVK)
+			req = httptest.NewRequest("POST", "http://svc-name.svc-ns.svc"+path, reader)
+			req.Header.Add(http.CanonicalHeaderKey("Content-Type"), "application/json")
+			w = httptest.NewRecorder()
+			svr.WebhookMux.ServeHTTP(w, req)
+			Expect(w.Code).To(Equal(http.StatusOK))
+			By("sanity checking the response contains reasonable field")
+			Expect(w.Body).To(ContainSubstring(`"allowed":true`))
+			Expect(w.Body).To(ContainSubstring(`"code":200`))
+		})
 	})
 })
 
@@ -511,6 +681,73 @@ func (dv *TestDefaultValidator) ValidateUpdate(old runtime.Object) error {
 
 func (dv *TestDefaultValidator) ValidateDelete() error {
 	if dv.Replica > 0 {
+		return errors.New("number of replica should be less than or equal to 0 to delete")
+	}
+	return nil
+}
+
+// TestMetaValidator
+var _ runtime.Object = &TestMetaValidatorObj{}
+
+type TestMetaValidatorObj struct {
+	Replica int `json:"replica,omitempty"`
+}
+
+var testMetaValidatorObjGVK = schema.GroupVersionKind{Group: "foo.test.org", Version: "v1", Kind: "TestMetaValidatorObj"}
+
+func (v *TestMetaValidatorObj) GetObjectKind() schema.ObjectKind { return v }
+func (v *TestMetaValidatorObj) DeepCopyObject() runtime.Object {
+	return &TestMetaValidatorObj{
+		Replica: v.Replica,
+	}
+}
+
+func (v *TestMetaValidatorObj) GroupVersionKind() schema.GroupVersionKind {
+	return testMetaValidatorObjGVK
+}
+
+func (v *TestMetaValidatorObj) SetGroupVersionKind(gvk schema.GroupVersionKind) {}
+
+var _ runtime.Object = &TestMetaValidatorObjList{}
+
+type TestMetaValidatorObjList struct{}
+
+func (*TestMetaValidatorObjList) GetObjectKind() schema.ObjectKind { return nil }
+func (*TestMetaValidatorObjList) DeepCopyObject() runtime.Object   { return nil }
+
+var _ admission.MetaValidator = &TestMetaValidator{}
+
+type TestMetaValidator struct{}
+
+func (v *TestMetaValidator) DeepCopyObject() runtime.Object {
+	return &TestMetaValidatorObj{}
+}
+
+func (v *TestMetaValidator) ValidateCreate(obj runtime.Object, _ v1beta1.AdmissionRequest) error {
+	if obj.(*TestMetaValidatorObj).Replica < 0 {
+		return errors.New("number of replica should be greater than or equal to 0")
+	}
+	return nil
+}
+
+func (v *TestMetaValidator) ValidateUpdate(raw, old runtime.Object, _ v1beta1.AdmissionRequest) error {
+	obj, ok := raw.(*TestMetaValidatorObj)
+	if !ok {
+		return fmt.Errorf("the object is expected to be TestMetaValidatorObj, not %T", raw)
+	}
+	if obj.Replica < 0 {
+		return errors.New("number of replica should be greater than or equal to 0")
+	}
+	if oldObj, ok := old.(*TestMetaValidatorObj); !ok {
+		return fmt.Errorf("the old object is expected to be %T", oldObj)
+	} else if obj.Replica < oldObj.Replica {
+		return fmt.Errorf("new replica %v should not be fewer than old replica %v", obj.Replica, oldObj.Replica)
+	}
+	return nil
+}
+
+func (v *TestMetaValidator) ValidateDelete(obj runtime.Object, _ v1beta1.AdmissionRequest) error {
+	if obj.(*TestMetaValidatorObj).Replica > 0 {
 		return errors.New("number of replica should be less than or equal to 0 to delete")
 	}
 	return nil

@@ -32,15 +32,67 @@ type Validator interface {
 	ValidateDelete() error
 }
 
+// MetaValidator defines functions for validating an operation that also
+// receive the request, giving access to e.g. the user info
+type MetaValidator interface {
+	// DeepCopyObject returns an empty object of the correct type
+	DeepCopyObject() runtime.Object
+	// ValidateCreate validates that the passed object can be created,
+	// and allows for the request to be examined
+	ValidateCreate(runtime.Object, v1beta1.AdmissionRequest) error
+	// ValidateUpdate validates that the object can be updated from `old` to `obj`,
+	// and allows for the request to be examined
+	ValidateUpdate(obj runtime.Object, old runtime.Object, req v1beta1.AdmissionRequest) error
+	// ValidateCreate validates that the passed object can be deleted,
+	// and allows for the request to be examined
+	ValidateDelete(runtime.Object, v1beta1.AdmissionRequest) error
+}
+
+// ValidatorWrapper wraps a Validator in a MetaValidator for compatibility
+type ValidatorWrapper struct {
+	Validator Validator
+}
+
+// NewValidatorWrapper creates a MetaValidator out of a Validator using a ValidatorWrapper
+func NewValidatorWrapper(validator Validator) MetaValidator {
+	return &ValidatorWrapper{Validator: validator}
+}
+
+// DeepCopyObject creates an empty object of the correct type. It delegates to
+// DeepCopyObject of the underlying Validator
+func (v *ValidatorWrapper) DeepCopyObject() runtime.Object {
+	return v.Validator.DeepCopyObject()
+}
+
+// ValidateCreate checks that `obj` can be created. It delegates to calling `ValidateCreate`
+// on the object, and assumes that it implements Validator
+func (v *ValidatorWrapper) ValidateCreate(obj runtime.Object, _ v1beta1.AdmissionRequest) error {
+	return obj.(Validator).ValidateCreate()
+}
+
+// ValidateDelete checks that `obj` can be deleted. It delegates to calling `ValidateDelete`
+// on the object, and assumes that it implements Validator
+func (v *ValidatorWrapper) ValidateDelete(obj runtime.Object, _ v1beta1.AdmissionRequest) error {
+	return obj.(Validator).ValidateDelete()
+}
+
+// ValidateUpdate checks that `obj` can be updated. It delegates to calling `ValidateUpdate`
+// on the object, and assumes that it implements Validator
+func (v *ValidatorWrapper) ValidateUpdate(obj, old runtime.Object, _ v1beta1.AdmissionRequest) error {
+	return obj.(Validator).ValidateUpdate(old)
+}
+
+var _ MetaValidator = &ValidatorWrapper{}
+
 // ValidatingWebhookFor creates a new Webhook for validating the provided type.
-func ValidatingWebhookFor(validator Validator) *Webhook {
+func ValidatingWebhookFor(validator MetaValidator) *Webhook {
 	return &Webhook{
 		Handler: &validatingHandler{validator: validator},
 	}
 }
 
 type validatingHandler struct {
-	validator Validator
+	validator MetaValidator
 	decoder   *Decoder
 }
 
@@ -59,14 +111,14 @@ func (h *validatingHandler) Handle(ctx context.Context, req Request) Response {
 	}
 
 	// Get the object in the request
-	obj := h.validator.DeepCopyObject().(Validator)
+	obj := h.validator.DeepCopyObject()
 	if req.Operation == v1beta1.Create {
 		err := h.decoder.Decode(req, obj)
 		if err != nil {
 			return Errored(http.StatusBadRequest, err)
 		}
 
-		err = obj.ValidateCreate()
+		err = h.validator.ValidateCreate(obj, req.AdmissionRequest)
 		if err != nil {
 			return Denied(err.Error())
 		}
@@ -84,7 +136,7 @@ func (h *validatingHandler) Handle(ctx context.Context, req Request) Response {
 			return Errored(http.StatusBadRequest, err)
 		}
 
-		err = obj.ValidateUpdate(oldObj)
+		err = h.validator.ValidateUpdate(obj, oldObj, req.AdmissionRequest)
 		if err != nil {
 			return Denied(err.Error())
 		}
@@ -98,7 +150,7 @@ func (h *validatingHandler) Handle(ctx context.Context, req Request) Response {
 			return Errored(http.StatusBadRequest, err)
 		}
 
-		err = obj.ValidateDelete()
+		err = h.validator.ValidateDelete(obj, req.AdmissionRequest)
 		if err != nil {
 			return Denied(err.Error())
 		}

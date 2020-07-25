@@ -32,10 +32,11 @@ import (
 
 // WebhookBuilder builds a Webhook.
 type WebhookBuilder struct {
-	apiType runtime.Object
-	gvk     schema.GroupVersionKind
-	mgr     manager.Manager
-	config  *rest.Config
+	apiType   runtime.Object
+	gvk       schema.GroupVersionKind
+	mgr       manager.Manager
+	config    *rest.Config
+	validator admission.MetaValidator
 }
 
 // WebhookManagedBy allows inform its manager.Manager
@@ -50,6 +51,14 @@ func WebhookManagedBy(m manager.Manager) *WebhookBuilder {
 // If the given object implements the admission.Validator interface, a ValidatingWebhook will be wired for this type.
 func (blder *WebhookBuilder) For(apiType runtime.Object) *WebhookBuilder {
 	blder.apiType = apiType
+	return blder
+}
+
+// UsingValidator sets the MetaValidator to use for the ValidatingWebhook for this type
+// This allows for implementing a MetaValidator rather than making the type implement the
+// Validator interface, and gives access to the request metadata
+func (blder *WebhookBuilder) UsingValidator(validator admission.MetaValidator) *WebhookBuilder {
+	blder.validator = validator
 	return blder
 }
 
@@ -109,10 +118,14 @@ func (blder *WebhookBuilder) registerDefaultingWebhook() {
 }
 
 func (blder *WebhookBuilder) registerValidatingWebhook() {
-	validator, isValidator := blder.apiType.(admission.Validator)
-	if !isValidator {
-		log.Info("skip registering a validating webhook, admission.Validator interface is not implemented", "GVK", blder.gvk)
-		return
+	validator := blder.validator
+	if validator == nil {
+		raw, isValidator := blder.apiType.(admission.Validator)
+		if !isValidator {
+			log.Info("skip registering a validating webhook, admission.Validator interface is not implemented", "GVK", blder.gvk)
+			return
+		}
+		validator = admission.NewValidatorWrapper(raw)
 	}
 	vwh := admission.ValidatingWebhookFor(validator)
 	if vwh != nil {
